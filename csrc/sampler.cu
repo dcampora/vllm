@@ -44,14 +44,24 @@ __global__ void apply_repetition_penalties_kernel(
   }
 }
 
-static inline __device__ uint16_t extractBinIdx(float x) {
-  union {
-    __half h;
-    uint16_t u16;
-  } tmp;
-  tmp.h = __float2half_rn(x);
-  tmp.u16 = (x < 0.f) ? (~tmp.u16 & 0xffff) : (tmp.u16 | 0x8000);
-  return 511 - (tmp.u16 >> 7);
+static inline __device__ uint32_t extractBinIdx(float x, int step) {
+  uint32_t bits = __float_as_uint(x);
+  bits = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+
+  if (step == 0) {
+    return 2047 - (bits >> 21);
+  } else if (step == 1) {
+    return 2047 - (bits >> 10) & 0x7ff;
+  } else {
+    return 2047 - bits & 0x3ff;
+  }
+}
+
+static inline __device__ bool isPartialMatch(float x, int step, uint32_t pattern) {
+  if (step == 0) {
+    return true;
+  }
+  return extractBinIdx(x, step - 1) == pattern;
 }
 
 template <int kNumThreadsPerBlock = 512>
@@ -59,7 +69,7 @@ static __global__ void topKPerRow(const float* logits, const int* rowStarts,
                                   const int* rowEnds, int* outIndices,
                                   int stride0, int stride1) {
   // The number of bins in the histogram.
-  static constexpr int kNumBins = 512;
+  static constexpr int kNumBins = 2048;
 
   // The top-k width.
   static constexpr int kTopK = 2048;
@@ -107,6 +117,7 @@ static __global__ void topKPerRow(const float* logits, const int* rowStarts,
   __shared__ int smemThresholdBinIdx[1];
   // Shared memory counter to register the candidates for the final phase.
   __shared__ int smemFinalDstIdx[1];
+  __shared__ bool needsAnotherStep[1];
 
   // The row computed by this block.
   int rowIdx = blockIdx.x;
@@ -130,84 +141,97 @@ static __global__ void topKPerRow(const float* logits, const int* rowStarts,
     return;
   }
 
-  // Clear the histogram.
-  if (threadIdx.x < kNumBins) {
-    smemHistogram[threadIdx.x] = 0;
-  }
+  int step = 0;
 
-  // Make sure the histogram is ready.
-  __syncthreads();
-
-  // Fetch elements one-by-one.
-  for (int rowIt = rowStart + threadIdx.x; rowIt < rowEnd;
-       rowIt += kNumThreadsPerBlock) {
-    uint16_t idx = extractBinIdx(logits[rowIdx * stride0 + rowIt * stride1]);
-    atomicAdd(&smemHistogram[idx], 1);
-  }
-
-  // Make sure the histogram is ready.
-  __syncthreads();
-
-  // Read the values from SMEM.
-  int binCount{0};
-  if (threadIdx.x < kNumBins) {
-    binCount = smemHistogram[threadIdx.x];
-  }
-
-  // Make sure each thread has read its value.
-  __syncthreads();
-
-  // Compute the prefix sum.
-  int prefixSum{0}, totalSum{0};
-  Scan(smemScan).ExclusiveSum(binCount, prefixSum, totalSum);
-
-  // Update the histogram with the prefix sums.
-  if (threadIdx.x < kNumBins) {
-    smemHistogram[threadIdx.x] = prefixSum;
-  }
-
-  // Make sure the data is in shared memory.
-  __syncthreads();
-
-  // Find the last valid bin.
-  if (threadIdx.x < kNumBins) {
-    int nextPrefixSum =
-        threadIdx.x == kNumBins - 1 ? totalSum : smemHistogram[threadIdx.x + 1];
-    if (prefixSum < kTopK && nextPrefixSum >= kTopK) {
-      smemThresholdBinIdx[0] = threadIdx.x;
+  while (step == 0 || needsAnotherStep[0]) {
+    // Clear the histogram.
+    for (int i = threadIdx.x; i < kNumBins; i += kNumThreadsPerBlock) {
+      smemHistogram[i] = 0;
     }
-  }
 
-  // Clear the counter to store the items for the final phase.
-  if (threadIdx.x == 0) {
-    smemFinalDstIdx[0] = 0;
-  }
+    // Make sure the histogram is ready.
+    __syncthreads();
 
-  // Make sure the data is in shared memory.
-  __syncthreads();
+    uint32_t logitPattern = step == 0 ? 0 : static_cast<uint32_t>(smemThresholdBinIdx[0]);
 
-  // The threshold bin.
-  int thresholdBinIdx = smemThresholdBinIdx[0];
-
-  // Fetch elements one-by-one and populate the shared memory buffers.
-  for (int rowIt = rowStart + threadIdx.x; rowIt < rowEnd;
-       rowIt += kNumThreadsPerBlock) {
-    float logit = logits[rowIdx * stride0 + rowIt * stride1];
-    uint16_t idx = extractBinIdx(logit);
-    if (idx < thresholdBinIdx) {
-      int dstIdx = atomicAdd(&smemHistogram[idx], 1);
-      smemIndices[dstIdx] = rowIt;
-    } else if (idx == thresholdBinIdx) {
-      int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
-      if (dstIdx < kNumFinalItems) {
-        smemFinal.items.logits[dstIdx] = logit;
-        smemFinal.items.indices[dstIdx] = rowIt;
+    // Fetch elements one-by-one.
+    for (int rowIt = rowStart + threadIdx.x; rowIt < rowEnd;
+        rowIt += kNumThreadsPerBlock) {
+      float logit = logits[rowIdx * stride0 + rowIt * stride1];
+      if (isPartialMatch(logit, step, logitPattern)) {
+        uint16_t idx = extractBinIdx(logit, step);
+        atomicAdd(&smemHistogram[idx], 1);
       }
     }
-  }
 
-  // Make sure the elements are in shared memory.
-  __syncthreads();
+    // Make sure the histogram is ready.
+    __syncthreads();
+
+    // Read the values from SMEM.
+    int binCount{0};
+    for (int i = threadIdx.x; i < kNumBins; i += kNumThreadsPerBlock) {
+      binCount = smemHistogram[i];
+    }
+
+    // Make sure each thread has read its value.
+    __syncthreads();
+
+    // Compute the prefix sum.
+    int prefixSum{0}, totalSum{0};
+    Scan(smemScan).ExclusiveSum(binCount, prefixSum, totalSum);
+
+    // Update the histogram with the prefix sums.
+    for (int i = threadIdx.x; i < kNumBins; i += kNumThreadsPerBlock) {
+      smemHistogram[i] = prefixSum;
+    }
+
+    // Make sure the data is in shared memory.
+    __syncthreads();
+
+    // Find the last valid bin.
+    for (int i = threadIdx.x; i < kNumBins; i += kNumThreadsPerBlock) {
+      int nextPrefixSum =
+          i == kNumBins - 1 ? totalSum : smemHistogram[i + 1];
+      if (prefixSum < kTopK && nextPrefixSum >= kTopK) {
+        smemThresholdBinIdx[0] = i;
+        needsAnotherStep[0] = step < 2 && nextPrefixSum - prefixSum > kNumFinalItems;
+      }
+    }
+
+    // Clear the counter to store the items for the final phase.
+    if (threadIdx.x == 0) {
+      smemFinalDstIdx[0] = 0;
+    }
+
+    // Make sure the data is in shared memory.
+    __syncthreads();
+
+    // The threshold bin.
+    int thresholdBinIdx = smemThresholdBinIdx[0];
+
+    // Fetch elements one-by-one and populate the shared memory buffers.
+    for (int rowIt = rowStart + threadIdx.x; rowIt < rowEnd;
+        rowIt += kNumThreadsPerBlock) {
+      float logit = logits[rowIdx * stride0 + rowIt * stride1];
+      if (isPartialMatch(logit, step, logitPattern)) {
+        uint16_t idx = extractBinIdx(logit, step);
+        if (idx < thresholdBinIdx) {
+          int dstIdx = atomicAdd(&smemHistogram[idx], 1);
+          smemIndices[dstIdx] = rowIt;
+        } else if (idx == thresholdBinIdx && !needsAnotherStep[0]) {
+          int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
+          if (dstIdx < kNumFinalItems) {
+            smemFinal.items.logits[dstIdx] = logit;
+            smemFinal.items.indices[dstIdx] = rowIt;
+          }
+        }
+      }
+    }
+
+    step++;
+
+    __syncthreads();
+  }
 
   // The logits of the elements to be sorted in the final pass.
   float finalLogits[kNumFinalItemsPerThread];
